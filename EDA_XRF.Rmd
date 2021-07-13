@@ -1,0 +1,76 @@
+---
+title: "XRF_EDA"
+author: "Matthew Harris"
+date: "2/25/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(readxl)
+library(knitr)
+```
+
+```{r}
+data_loc <- "C:/Project_files/NCDOT_Lithic_Sourcing/DATA"
+
+### Steponaitis et.al 2006 Data
+Step_NAA_dat1 <- read_xls(file.path(data_loc, "SteponaitisEtAl2006Data", "TableD01_8_21_clean.xls"))
+Step_NAA_dat2 <- read_xls(file.path(data_loc, "SteponaitisEtAl2006Data", "TableD02_8_21_clean.xls"))
+Step_XRF_major_dat <- read_xls(file.path(data_loc, 
+                                         "SteponaitisEtAl2006Data", "TableE01_8_20_clean.xls"))
+Step_XRF_trace_dat <- read_xls(file.path(data_loc, 
+                                         "SteponaitisEtAl2006Data", "TableE02_8_20_clean.xls"))
+### AECOM DATA
+AECOM_XRF <- read_xlsx(file.path(data_loc, "NAA and XRF data.xlsx"), sheet = "XRF_data")
+AECOM_NAA <- read_xlsx(file.path(data_loc, "NAA and XRF data.xlsx"), sheet = "NAA_data")
+
+Step_NAA <- full_join(Step_NAA_dat1, Step_NAA_dat2, by = 'Sample')
+Step_XRF <- full_join(Step_XRF_major_dat, Step_XRF_trace_dat, by = 'Sample')
+```
+
+
+```{r}
+### joined data comparison
+common_elemets <- colnames(AECOM_XRF)[colnames(AECOM_XRF) %in% colnames(Step_XRF)]
+joint_XRF <- dplyr::select(AECOM_XRF, common_elemets) %>% 
+  mutate(Source = "AECOM") %>% 
+  rbind(., Step_XRF[common_elemets] %>% 
+          mutate(Source = "Steponaitis")) %>% 
+  gather(Element, Value, -Sample, -Source)
+
+joint_XRF_means <- joint_XRF %>% 
+  group_by(Source, Element) %>% 
+  summarise(Mean = mean(Value, na.rm = TRUE),
+            STD   = sd(Value, na.rm = TRUE)) %>% 
+  nest(Element, Mean, STD, .key = "value_col") %>% 
+  spread(key = Source, value = value_col) %>% 
+  unnest() %>% 
+  dplyr::select(Element, "AECOM_Mean" = Mean, "AECOM_STD" = STD,
+                "Steponaitis_Mean" = Mean1, "Steponaitis_STD" = STD1)
+knitr::kable(joint_XRF_means, digits = 3)
+```
+
+
+```{r warning=FALSE}
+plot_order <- joint_XRF %>% 
+  group_by(Source, Element) %>% 
+  summarise(mean = mean(Value, na.rm = TRUE)) %>% 
+  arrange(desc(mean))
+ggplot(joint_XRF) +
+  aes(x = Element, y = Value, color = Source) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.1), shape = 1) +
+  scale_x_discrete(limits=unique(plot_order$Element)) +
+  theme_bw()
+```
+
+
+
+
+  
+  
+  

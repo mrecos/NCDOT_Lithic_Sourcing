@@ -1,0 +1,1095 @@
+---
+title: "Neutron Activation Analysis - Results Comparison"
+author: "Matthew D. Harris"
+date: "March 5, 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(cache = TRUE)
+```
+
+# PCA stuff {.tabset}
+
+## Data Preperation
+
+```{r message=FALSE, warning=FALSE, cache=FALSE}
+library(tidyverse)
+library(readxl)
+library(factoextra)
+library(viridisLite)
+library(tidymodels)
+library(caret)
+library(cowplot)
+library(knitr)
+# devtools::install_github("vqv/ggbiplot")
+library(ggbiplot)
+library(ggrepel)
+library(ICSNP)
+```
+
+
+```{r include=FALSE, cache=FALSE}
+replace_Inf_0 <- function(x){
+  if_else(is.infinite(x),0,x)
+}
+mah_func <- function(yi, X_barx, Ix){
+  mahalanobis(yi, X_barx, cov = Ix, inverted = TRUE)
+}
+mah_func_T2 <- function(X,y,metric="p.value"){
+  if(is(X,"data.frame")){
+    X <- as.matrix(X)
+  }
+  xx <- HotellingsT2(X, y, test = "f", mu = 0)
+  if(metric == "p.value"){
+    return(as.numeric(xx$p.value))
+  }else if(metric == "statistic"){
+    return(as.numeric(xx$test.statistic))
+  }
+}
+loo_Xbar_I <- function(train_data){
+  # group centroid
+  X_bar <- train_data %>% 
+    dplyr::select(-Sample, -Quarry_Zone) %>% 
+    split(.$Quarry_Zone_Group) %>% 
+    map(., function(.x) colMeans(.x[,-1])) 
+  # inverse of group cov matrix
+  I <- train_data %>%
+    dplyr::select(-Sample, -Quarry_Zone) %>%
+    split(.$Quarry_Zone_Group) %>%
+    map(., function(.x) cov(.x[,-1])) %>%
+    map(., function(.x) solve(.x, tol = 1.18394e-23)) ## had to make tol very small to solve
+
+    return(list(X_bar = X_bar, I = I))
+}
+loo_X_T2 <- function(train_data){
+  # group centroid
+  X <- train_data %>% 
+    dplyr::select(-Sample, -Quarry_Zone) %>% 
+    split(.$Quarry_Zone_Group)
+}
+loo_mah_func <- function(yi,name,dat){
+  dat <- dplyr::filter(dat, Sample != name)
+  loo_dat <- loo_Xbar_I(dat)
+  loo_man <- map2(loo_dat$X_bar, loo_dat$I, function(x,z) mah_func(yi,x,z))
+}
+loo_mah_func_T2 <- function(yi,name,dat, metric="p.value"){
+  dat <- dplyr::filter(dat, Sample != name)
+  loo_dat <- loo_X_T2(dat)
+  loo_man <- map(loo_dat, function(.X) mah_func_T2(.X[,-1],yi,metric))
+}
+"%ni%" <- Negate("%in%")
+fit_model <- function(split, spec, form, remove_cols=NULL) {
+  fit_data <- analysis(split)
+  if(!is.null(remove_cols)){ # remove id and sample (non-modeling) columns
+    fit_data <- fit_data[, setdiff(colnames(fit_data), remove_cols)]
+  }
+  fit(
+    object = spec, 
+    formula = form,
+    data =fit_data
+  )
+}
+compute_pred <- function(split, model) {
+  assess <- assessment(split)
+  pred_class <- predict(model, new_data = assess)
+  bind_cols(assess, pred_class)
+}
+compute_perf <- function(pred_df) {
+  numeric_metrics <- metric_set(accuracy, kap)
+  numeric_metrics(
+    pred_df, 
+    truth = Quarry_Zone_Group, 
+    estimate = .pred_class
+  )
+}
+get_id_left_out <- function(x,col_name){
+  # rediculous factor workaround
+  if(is(assessment(x),"tbl_df")){
+    val <- as.character(assessment(x)[,col_name][1,1,drop=TRUE])
+  }else if(is(assessment(x), "data.frame")){
+     # tbl_df is also data.frame (warning)
+    val <- as.character(assessment(x)[,col_name])
+  }
+  return(val)
+}
+`HotellingsT2` <- function(X,Y=NULL,mu, test){
+  ## adapated from here: https://github.com/cran/ICSNP/blob/master/R/HotellingsT.internal.R
+  ## I needed more tolerance on solve() b/c of non-invertability
+  n<-dim(X)[1]
+  p<-dim(X)[2]
+  
+    # else two sample case
+  n1<-n
+  n2<-dim(Y)[1]
+  Xmeans<-colMeans(X)
+  Ymeans<-colMeans(Y)
+  X.diff<-sweep(X,2,Xmeans)
+  Y.diff<-sweep(Y,2,Ymeans)
+  S.pooled<-1/(n1+n2-2)*(t(X.diff)%*%X.diff+t(Y.diff)%*%Y.diff)
+  test.statistic<-n1*n2/(n1+n2)*t(Xmeans-Ymeans-mu)%*%solve(S.pooled,tol = 1.18394e-23)%*%(Xmeans-Ymeans-mu)*switch(test,f=(n1+n2-p-1)/(p*(n1+n2-2)),chi=1)
+  df.1<-p
+  df.2<-switch(test,f=n1+n2-p-1,chi=NA)
+  if(test.statistic[1,1] == 0){
+    p.value = 0
+  } else {
+    p.value<-1-switch(test,f=pf(test.statistic,df.1,df.2),chi=pchisq(test.statistic,df.1))
+  }
+  list(test.statistic=test.statistic,p.value=p.value,df.1=df.1,df.2=df.2)
+}
+
+
+```
+
+
+```{r}
+data_loc <- "./DATA"
+
+### Steponaitis et.al 2006 Data
+Step_NAA_dat1 <- read_xls(file.path(data_loc, "SteponaitisEtAl2006Data", "TableD01_8_21_clean.xls"))
+Step_NAA_dat2 <- read_xls(file.path(data_loc, "SteponaitisEtAl2006Data", "TableD02_8_21_clean.xls"))
+Step_XRF_major_dat <- read_xls(file.path(data_loc, 
+                                         "SteponaitisEtAl2006Data", "TableE01_8_20_clean.xls"))
+Step_XRF_trace_dat <- read_xls(file.path(data_loc, 
+                                         "SteponaitisEtAl2006Data", "TableE02_8_20_clean.xls"))
+Step_prov_dat <- read_xls(file.path(data_loc, 
+                                         "SteponaitisEtAl2006Data", "TableA02_9_09_05_clean.xls"))
+### AECOM DATA
+AECOM_XRF <- read_xlsx(file.path(data_loc, "NAA and XRF data.xlsx"), sheet = "XRF_data") %>%
+  dplyr::select(sort(names(.)))
+AECOM_NAA <- read_xlsx(file.path(data_loc, "NAA and XRF data.xlsx"), sheet = "NAA_data") %>% 
+  dplyr::select(sort(names(.)))
+
+Step_NAA <- full_join(Step_NAA_dat1, Step_NAA_dat2, by = 'Sample') %>% 
+  dplyr::select(sort(names(.)))
+Step_XRF <- full_join(Step_XRF_major_dat, Step_XRF_trace_dat, by = 'Sample')  %>% 
+  dplyr::select(sort(names(.)))
+```
+
+
+```{r}
+### joined data comparison NAA
+common_elemets <- colnames(AECOM_NAA)[colnames(AECOM_NAA) %in% colnames(Step_NAA)]
+
+joint_NAA <- dplyr::select(AECOM_NAA, common_elemets) %>% 
+  mutate(Source = "AECOM") %>% 
+  rbind(., Step_NAA[common_elemets] %>% 
+          mutate(Source = "Steponaitis")) %>% 
+  dplyr::select(-As, -Cr, -Ni, -Sr, -U, -V) %>%  # Step et al. pg79
+  mutate_if(is.numeric, log, base = 10) %>% # Step et al. pg77
+  mutate_if(is.numeric,replace_Inf_0) %>%   # Step et al. pg77
+  filter(Sample != "FBL039") %>%            # Step et al. pg79
+  gather(Element, Value, -Sample, -Source) %>% 
+  left_join(., dplyr::select(Step_prov_dat, Sample, Quarry_Zone), by = "Sample") %>% 
+  mutate(Quarry_Zone = if_else(Source == "AECOM","AECOM",Quarry_Zone)) %>% 
+  mutate(Quarry_Zone = if_else(is.na(Quarry_Zone),"UNK",Quarry_Zone)) %>% 
+  mutate(Quarry_Zone_Group = case_when(      # Step et al. pg102
+    Quarry_Zone %in% c("Uwharries Eastern","Uwharries Southeastern",
+                       "Uwharries Southern","Uwharries Western") ~ "Uwharries.1",
+    Quarry_Zone == "Uwharries Asheboro" ~ "Uwharries.2",
+    Quarry_Zone %in% c("Chatham Pittsboro","Chatham Siler City") ~ "Chatham.1",
+    Quarry_Zone == "Chatham Silk Hope" ~ "Chatham.2",
+    Quarry_Zone == "Cumberland County" ~ "Cumberland",
+    Quarry_Zone == "Orange County" ~ "Orange",
+    Quarry_Zone == "Person County" ~ "Person",
+    Quarry_Zone == "Durham County" ~ "Durham",
+    Quarry_Zone == "UNK" ~ "UNK",
+    Quarry_Zone == "AECOM" ~ "AECOM"
+  ))
+
+### NAA
+joint_NAA_wide <- joint_NAA %>% 
+  spread(Element, Value) %>% 
+  dplyr::select(-Source) %>% 
+  na.omit()
+
+Step_NAA_wide <- joint_NAA %>% 
+  filter(Source != "AECOM") %>% 
+  spread(Element, Value) %>% 
+  dplyr::select(-Source) %>% 
+  na.omit()
+
+AECOM_NAA_wide <- joint_NAA %>% 
+  filter(Source == "AECOM") %>%
+  spread(Element, Value) %>% 
+  dplyr::select(-Source) %>% 
+  na.omit()
+
+NAA_train_data <- Step_NAA_wide %>% 
+  dplyr::filter(Quarry_Zone_Group != "UNK") 
+NAA_test_data <- Step_NAA_wide %>% 
+  dplyr::filter(Quarry_Zone_Group == "UNK") 
+
+# test to make sure we have the right elements as step et al.
+step_elements <- c("La","Lu","Nd","Sm","Yb","Ce","Co",
+                   "Cs","Eu","Fe","Hf","Rb","Sb","Sc",
+                   "Ta","Tb","Th","Zn","Zr","Al","Ba",
+                   "Ca","Dy","K" ,"Mn","Na","Ti")
+all.equal(sort(unique(joint_NAA$Element)), sort(step_elements))
+
+head(NAA_train_data) %>% dplyr::select(1:10) %>% kable()
+```
+
+## `prcomp` Results
+```{r}
+## princomp (legacy method, but closer results to paper)
+# NAA_pca <- princomp(NAA_train_data[,-c(1:3)])
+
+## this config of `prcomp` achieved the closest replication of steph's work
+NAA_pca <- prcomp(NAA_train_data[,-c(1:3)], retx = TRUE, center = TRUE, scale. = FALSE)
+
+fviz_eig(NAA_pca)
+```
+
+### Biplots and all that stuff
+```{r}
+NAA_test_preds <- predict(NAA_pca, newdata = NAA_test_data) %>% 
+  as.data.frame() %>% 
+  # dplyr::select(Comp.1, Comp.2, Comp.3) %>% 
+  dplyr::select(Comp.1 = PC1, Comp.2 = PC2, Comp.3 = PC3) %>% 
+  dplyr::mutate(Sample = NAA_test_data$Sample)
+
+NAA_AECOM_preds <- predict(NAA_pca, newdata = AECOM_NAA_wide) %>% 
+  as.data.frame() %>% 
+  # dplyr::select(Comp.1, Comp.2, Comp.3) %>% 
+  dplyr::select(Comp.1 = PC1, Comp.2 = PC2, Comp.3 = PC3) %>%  dplyr::mutate(Sample = AECOM_NAA_wide$Sample)
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# steponaitis observation plots (NO test data)
+step_obs_plot_12 <- ggbiplot(NAA_pca, groups = NAA_train_data$Quarry_Zone_Group, 
+         ellipse = TRUE, ellipse.prob = .75, var.axes = FALSE, choices = 1:2) + theme_bw()
+step_obs_plot_23 <- ggbiplot(NAA_pca, groups = NAA_train_data$Quarry_Zone_Group, 
+         ellipse = TRUE, ellipse.prob = .75, var.axes = FALSE, choices = 2:3) + theme_bw()
+step_obs_plot_13 <- ggbiplot(NAA_pca, groups = NAA_train_data$Quarry_Zone_Group, 
+         ellipse = TRUE, ellipse.prob = .75, var.axes = FALSE, choices = c(1,3)) + theme_bw()
+# steponaitis observation plots (with test data)
+step_test_obs_plot_12 <- ggbiplot(NAA_pca, groups = NAA_train_data$Quarry_Zone_Group, 
+         ellipse = TRUE, ellipse.prob = .75, var.axes = FALSE, choices = 1:2) +
+  geom_point(data = NAA_test_preds, aes(x = Comp.1,y = Comp.2)) +
+  geom_text_repel(data = NAA_test_preds, aes(x = Comp.1,y = Comp.2, label = Sample),
+                  point.padding = 0.5, force = 3, max.iter = 8000) + theme_bw() 
+step_test_obs_plot_23 <- ggbiplot(NAA_pca, groups = NAA_train_data$Quarry_Zone_Group, 
+         ellipse = TRUE, ellipse.prob = .75, var.axes = FALSE, choices = 2:3) +
+  geom_point(data = NAA_test_preds, aes(x = Comp.2,y = Comp.3)) +
+  geom_text_repel(data = NAA_test_preds, aes(x = Comp.2,y = Comp.3, label = Sample),
+                  point.padding = 0.5, force = 3, max.iter = 8000) + theme_bw()
+step_test_obs_plot_13 <- ggbiplot(NAA_pca, groups = NAA_train_data$Quarry_Zone_Group, 
+         ellipse = TRUE, ellipse.prob = .75, var.axes = FALSE, choices = c(1,3)) +
+  geom_point(data = NAA_test_preds, aes(x = Comp.1,y = Comp.3)) +
+  geom_text_repel(data = NAA_test_preds, aes(x = Comp.1,y = Comp.3, label = Sample),
+                  point.padding = 0.5, force = 3, max.iter = 8000) + theme_bw()
+# AECOM observation plots (with test)
+AECOM_obs_plot_12 <- ggbiplot(NAA_pca, groups = NAA_train_data$Quarry_Zone_Group, 
+         ellipse = TRUE, ellipse.prob = .75, var.axes = FALSE, choices = 1:2) +
+  geom_point(data = NAA_AECOM_preds, aes(x = Comp.1,y = Comp.2)) +
+  geom_text_repel(data = NAA_AECOM_preds, aes(x = Comp.1,y = Comp.2, label = Sample),
+                  point.padding = 0.5, force = 3, max.iter = 8000) + theme_bw()
+AECOM_obs_plot_23 <- ggbiplot(NAA_pca, groups = NAA_train_data$Quarry_Zone_Group, 
+         ellipse = TRUE, ellipse.prob = .75, var.axes = FALSE, choices = 2:3) +
+  geom_point(data = NAA_AECOM_preds, aes(x = Comp.2,y = Comp.3)) +
+  geom_text_repel(data = NAA_AECOM_preds, aes(x = Comp.2,y = Comp.3, label = Sample),
+                  point.padding = 0.5, force = 3, max.iter = 8000) + theme_bw()
+AECOM_obs_plot_13 <- ggbiplot(NAA_pca, groups = NAA_train_data$Quarry_Zone_Group, 
+         ellipse = TRUE, ellipse.prob = .75, var.axes = FALSE, choices = c(1,3)) +
+  geom_point(data = NAA_AECOM_preds, aes(x = Comp.1,y = Comp.3)) +
+  geom_text_repel(data = NAA_AECOM_preds, aes(x = Comp.1,y = Comp.3, label = Sample),
+                  point.padding = 0.5, force = 3, max.iter = 8000) + theme_bw()
+# Steponaitis variable plots (no test data)
+step_var_plot_12 <- ggbiplot(NAA_pca, groups = NAA_train_data$Quarry_Zone_Group, 
+         circle = T, alpha = 0.45, varname.size = 4, varname.adjust = 3, choices = 1:2) +
+  scale_x_continuous(limits = c(-1.75,1.75)) +
+  scale_y_continuous(limits = c(-1.75,1.75)) +
+  theme_bw() +
+  theme(legend.position = "none")
+step_var_plot_23 <- ggbiplot(NAA_pca, groups = NAA_train_data$Quarry_Zone_Group, 
+         circle = T, alpha = 0.45, varname.size = 4, varname.adjust = 3, choices = 2:3) +
+  scale_x_continuous(limits = c(-1.75,1.75)) +
+  scale_y_continuous(limits = c(-1.75,1.75)) +
+  theme_bw() +
+  theme(legend.position = "none")
+step_var_plot_13 <- ggbiplot(NAA_pca, groups = NAA_train_data$Quarry_Zone_Group, 
+         circle = T, alpha = 0.45, varname.size = 4, varname.adjust = 3, choices = c(1,3)) +
+  scale_x_continuous(limits = c(-1.75,1.75)) +
+  scale_y_continuous(limits = c(-1.75,1.75)) +
+  theme_bw() +
+  theme(legend.position = "none")
+```
+
+### Biplot of Steponaitis Sourced Data
+```{r echo=FALSE, fig.width=11, message=FALSE, warning=FALSE}
+
+legend_b <- get_legend(step_obs_plot_12 + theme(legend.direction = "horizontal",
+                                                legend.justification="center" ,
+                                                legend.box.just = "bottom"))
+
+step_obs_plots_row <- plot_grid(step_obs_plot_12 + theme( legend.position = "none"), 
+                            step_obs_plot_23 + theme( legend.position = "none"), 
+                            step_obs_plot_13 + theme( legend.position = "none"), 
+                                      nrow = 1, labels = c("PC 2/1", "PC 3/2", "PC 3/1"), 
+                                      axis = "t", align = "h")
+step_obs_plots <- plot_grid(step_obs_plots_row, legend_b, ncol = 1, rel_heights = c(1, .2))
+
+
+step_var_obs_plots <- plot_grid(step_var_plot_12, step_var_plot_23,step_var_plot_13, nrow = 1, 
+                   labels = c("PC 2/1", "PC 3/2", "PC 3/1"), axis = "t", align = "h")
+
+step_obs_plots
+
+step_var_obs_plots
+```
+
+### Steponaitis Test Data 
+```{r echo=FALSE, fig.width=11, message=FALSE, warning=FALSE}
+step_test_obs_plots_row <- plot_grid(step_test_obs_plot_12 + theme( legend.position = "none"),
+                                     step_test_obs_plot_23 + theme( legend.position = "none"),
+                                     step_test_obs_plot_13 + theme( legend.position = "none"),
+                                     nrow = 1, labels = c("PC 2/1", "PC 3/2", "PC 3/1"), 
+                                     axis = "t", align = "h")
+step_test_obs_plots <- plot_grid(step_test_obs_plots_row, legend_b, 
+                                 ncol = 1, rel_heights = c(1, .2))
+
+step_test_obs_plots
+```
+
+### AECOM Test Data
+```{r echo=FALSE, fig.width=11, message=FALSE, warning=FALSE}
+AECOM_obs_plots_row <- plot_grid(AECOM_obs_plot_12 + theme( legend.position = "none"),
+                                 AECOM_obs_plot_23 + theme( legend.position = "none"),
+                                 AECOM_obs_plot_13 + theme( legend.position = "none"), 
+                                 nrow = 1, labels = c("PC 2/1", "PC 3/2", "PC 3/1"), 
+                                 axis = "t", align = "h")
+AECOM_obs_plots <- plot_grid(AECOM_obs_plots_row, legend_b, 
+                                 ncol = 1, rel_heights = c(1, .2))
+
+AECOM_obs_plots
+```
+
+
+```{r echo=FALSE}
+NAA_train_data_pca <- cbind(NAA_train_data[,1:3],as.data.frame(NAA_pca$x[,1:5])) %>% 
+  mutate(Quarry_Zone_Group = factor(Quarry_Zone_Group))
+```
+
+## PCA Validation
+
+### LOOCV
+
+#### Mahalanobis
+```{r}
+# y from step, point to measure distance from for each group centroid (X_bar)
+y_train = NAA_train_data_pca %>% 
+  dplyr::select(-Quarry_Zone, -Quarry_Zone_Group) %>% 
+  split(.$Sample) %>% 
+  map(., function(.x) as.matrix(.x[,-1]))
+
+## original method. behavior of dplyr::bind_rows may have changed
+## returns data in wide format due to differing column names
+# loo_mah_distance <- map2(y_train, names(y_train), 
+#                      function(.y,.name) loo_mah_func(.y, .name, NAA_train_data_pca)) %>% 
+#   map(., bind_rows)  %>% 
+#   bind_rows(., .id = "Sample")
+
+## V2 update: do I want this as a wide or long dataset? not sure yet.
+## here is long form
+loo_mah_distance <- map2(y_train, names(y_train), 
+                     function(.y,.name) loo_mah_func(.y, .name, NAA_train_data_pca)) %>% 
+  map(., bind_rows, .id = "Quarry")  %>%
+  map(., function(.x) dplyr::rename(.x, "Value" = 2)) %>% 
+  bind_rows(., .id = "Sample")
+
+
+loo_mah_T2 <- map2(y_train, names(y_train), 
+                     function(.y,.name) loo_mah_func_T2(.y, .name, NAA_train_data_pca,
+                                                        metric = "p.value")) %>% 
+  map(., bind_rows) %>% 
+  bind_rows(., .id = "Sample")
+```
+
+```{r echo=FALSE}
+loo_mah_distance_min <- loo_mah_distance %>% 
+  gather(Group_min, value, -Sample) %>% 
+  dplyr::group_by(Sample) %>% 
+  filter(value == min(value)) %>% 
+  dplyr::select(-value) %>%
+  left_join(loo_mah_distance, ., by = "Sample") %>% 
+  left_join(., dplyr::select(NAA_train_data_pca, Sample, Quarry_Zone_Group), by = "Sample")
+
+loo_mah_T2_max <- loo_mah_T2 %>% 
+  gather(Group_max, value, -Sample) %>% 
+  dplyr::group_by(Sample) %>% 
+  filter(value == max(value)) %>% 
+  dplyr::select(-value) %>%
+  left_join(loo_mah_T2, ., by = "Sample") %>% 
+  left_join(., dplyr::select(NAA_train_data_pca, Sample, Quarry_Zone_Group), by = "Sample") %>% 
+  mutate_if(is.double, round, digits = 3)
+
+mah_results <- loo_mah_distance_min %>% 
+  dplyr::select(Sample, Quarry_Zone_Group, "pred_class" = Group_min) %>% 
+  mutate(correct = as.numeric(Quarry_Zone_Group == pred_class),
+         Quarry_Zone_Group = as.factor(Quarry_Zone_Group),
+         pred_class = as.factor(pred_class))
+
+mah_T2_results <- loo_mah_T2_max %>% 
+  dplyr::select(Sample, Quarry_Zone_Group, "pred_class" = Group_max) %>% 
+  mutate(correct = as.numeric(Quarry_Zone_Group == pred_class),
+         Quarry_Zone_Group = as.factor(Quarry_Zone_Group),
+         pred_class = as.factor(pred_class))
+
+loo_mah_cm   <- confusionMatrix(data = mah_results$pred_class, reference = mah_results$Quarry_Zone_Group)
+loo_mah_T2cm <- confusionMatrix(data = mah_T2_results$pred_class, reference = mah_T2_results$Quarry_Zone_Group)
+```
+
+#### XGB
+```{r}
+NAA_form <- formula(Quarry_Zone_Group ~ .)
+# single fit on cv
+spec_XGB <- boost_tree(trees = 2000, mode = "classification") %>% 
+  set_engine("xgboost")
+```
+
+```{r echo=FALSE}
+loocv_splits_XGB <- loo_cv(data = NAA_train_data_pca) %>%
+  mutate(
+    id         = map_chr(splits, get_id_left_out, "Sample"),
+    Quarry     = map_chr(splits, get_id_left_out, "Quarry_Zone_Group"),
+    models_XGB = map(splits, fit_model, spec_XGB, form=NAA_form, remove_cols=c("Sample","Quarry_Zone")),
+    pred_XGB   = map2(splits, models_XGB, compute_pred),
+    perf_XGB   = map(pred_XGB, compute_perf),
+    accuracy   = map_dbl(perf_XGB, ~ as.numeric(.x[1,3])),
+    pred_class = map_chr(pred_XGB, ~ as.character(.x[1,".pred_class"]))
+  )
+
+loocv_results_XGB <- loocv_splits_XGB %>% 
+  dplyr::select("Sample" = id, "Quarry_Zone_Group" = Quarry, pred_class) %>% 
+  mutate(correct = as.numeric(Quarry_Zone_Group == pred_class),
+         Quarry_Zone_Group = as.factor(Quarry_Zone_Group),
+         pred_class = as.factor(pred_class))
+loocv_cm_XGB <- confusionMatrix(data = loocv_results_XGB$pred_class, 
+                                reference = loocv_results_XGB$Quarry_Zone_Group)
+```
+
+#### RF
+```{r}
+spec_rf <- rand_forest(trees = 2000, mode = "classification") %>% 
+  set_engine("ranger")
+```
+
+```{r echo=FALSE}
+loocv_splits_rf <- loo_cv(data = NAA_train_data_pca) %>%
+  mutate(
+    id         = map_chr(splits, get_id_left_out, "Sample"),
+    Quarry     = map_chr(splits, get_id_left_out, "Quarry_Zone_Group"),
+    models_rf  = map(splits, fit_model, spec_rf, form=NAA_form, remove_cols=c("Sample","Quarry_Zone")),
+    pred_rf    = map2(splits, models_rf, compute_pred),
+    perf_rf    = map(pred_rf, compute_perf),
+    accuracy   = map_dbl(perf_rf, ~ as.numeric(.x[1,3])),
+    pred_class = map_chr(pred_rf, ~ as.character(.x[1,".pred_class"]))
+  )
+
+loocv_results_rf <- loocv_splits_rf %>% 
+  dplyr::select("Sample" = id, "Quarry_Zone_Group" = Quarry, pred_class) %>% 
+  mutate(correct = as.numeric(Quarry_Zone_Group == pred_class),
+         Quarry_Zone_Group = as.factor(Quarry_Zone_Group),
+         pred_class = as.factor(pred_class))
+loocv_cm_rf <- confusionMatrix(data = loocv_results_rf$pred_class, 
+                                reference = loocv_results_rf$Quarry_Zone_Group)
+```
+
+#### KNN
+```{r}
+spec_KNN <- nearest_neighbor(neighbors = 3, mode = "classification") %>% 
+  set_engine("kknn")
+```
+
+```{r echo=FALSE, cache=TRUE}
+loocv_splits_KNN <- loo_cv(data = NAA_train_data_pca) %>%
+  mutate(
+    id         = map_chr(splits, get_id_left_out, "Sample"),
+    Quarry     = map_chr(splits, get_id_left_out, "Quarry_Zone_Group"),
+    models_KNN = map(splits, fit_model, spec_KNN, form=NAA_form, remove_cols=c("Sample","Quarry_Zone")),
+    pred_KNN   = map2(splits, models_KNN, compute_pred),
+    perf_KNN   = map(pred_KNN, compute_perf),
+    accuracy   = map_dbl(perf_KNN, ~ as.numeric(.x[1,3])),
+    pred_class = map_chr(pred_KNN, ~ as.character(.x[1,".pred_class"]))
+  )
+
+loocv_results_KNN <- loocv_splits_KNN %>% 
+  dplyr::select("Sample" = id, "Quarry_Zone_Group" = Quarry, pred_class) %>% 
+  mutate(correct = as.numeric(Quarry_Zone_Group == pred_class),
+         Quarry_Zone_Group = as.factor(Quarry_Zone_Group),
+         pred_class = as.factor(pred_class))
+loocv_cm_KNN <- confusionMatrix(data = loocv_results_KNN$pred_class, 
+                                reference = loocv_results_KNN$Quarry_Zone_Group)
+```
+
+#### SVM
+```{r}
+spec_SVM <- svm_rbf(mode = "classification") %>% 
+  set_engine("kernlab")
+```
+
+```{r echo=FALSE}
+loocv_splits_SVM <- loo_cv(data = NAA_train_data_pca) %>%
+  mutate(
+    id         = map_chr(splits, get_id_left_out, "Sample"),
+    Quarry     = map_chr(splits, get_id_left_out, "Quarry_Zone_Group"),
+    models_SVM = map(splits, fit_model, spec_SVM, form=NAA_form, remove_cols=c("Sample","Quarry_Zone")),
+    pred_SVM   = map2(splits, models_SVM, compute_pred),
+    perf_SVM   = map(pred_SVM, compute_perf),
+    accuracy   = map_dbl(perf_SVM, ~ as.numeric(.x[1,3])),
+    pred_class = map_chr(pred_SVM, ~ as.character(.x[1,".pred_class"]))
+  )
+
+loocv_results_SVM <- loocv_splits_SVM %>% 
+  dplyr::select("Sample" = id, "Quarry_Zone_Group" = Quarry, pred_class) %>% 
+  mutate(correct = as.numeric(Quarry_Zone_Group == pred_class),
+         Quarry_Zone_Group = as.factor(Quarry_Zone_Group),
+         pred_class = as.factor(pred_class))
+loocv_cm_SVM <- confusionMatrix(data = loocv_results_SVM$pred_class, 
+                                reference = loocv_results_SVM$Quarry_Zone_Group)
+```
+
+### Confusion Matrix Plots
+```{r echo=FALSE}
+mah_plot <- ggplot(as.data.frame(loo_mah_cm$table), 
+       aes(x=factor(Reference, levels = rev(levels(Reference))), y=Prediction, fill=Freq)) + 
+  scale_fill_viridis_c(option = "A", begin = 0.15, end = 1, direction = -1) +
+  scale_x_discrete(position = "top") + 
+  coord_equal() +
+  geom_tile(color = "gray80") +
+  labs(x = "Ground Truth", y = "Prediction",
+       caption = paste("Accuracy:",round(loo_mah_cm$overall["Accuracy"],3),
+                        "Kappa:",round(loo_mah_cm$overall["Kappa"],3))) +
+  geom_text(aes(label = ifelse(Freq > 0, Freq, '-')), color = "gray50") +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 0)
+  )
+
+# loo_mah_T2cm
+mah_plot_T2 <- ggplot(as.data.frame(loo_mah_T2cm$table), 
+       aes(x=factor(Reference, levels = rev(levels(Reference))), y=Prediction, fill=Freq)) + 
+  scale_fill_viridis_c(option = "A", begin = 0.15, end = 1, direction = -1) +
+  scale_x_discrete(position = "top") + 
+  coord_equal() +
+  geom_tile(color = "gray80") +
+  labs(x = "Ground Truth", y = "Prediction",
+       caption = paste("Accuracy:",round(loo_mah_T2cm$overall["Accuracy"],3),
+                        "Kappa:",round(loo_mah_T2cm$overall["Kappa"],3))) +
+  geom_text(aes(label = ifelse(Freq > 0, Freq, '-')), color = "gray50") +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 0)
+  )
+```
+
+```{r echo=FALSE}
+XGB_plot <- ggplot(as.data.frame(loocv_cm_XGB$table), 
+       aes(x=factor(Reference, levels = rev(levels(Reference))), y=Prediction, fill=Freq)) + 
+  scale_fill_viridis_c(option = "A", begin = 0.15, end = 1, direction = -1) +
+  scale_x_discrete(position = "top") + 
+  coord_equal() +
+  geom_tile(color = "gray80") +
+  labs(x = "Ground Truth", y = "Prediction",
+       caption = paste("Accuracy:",round(loocv_cm_XGB$overall["Accuracy"],3),
+                        "Kappa:",round(loocv_cm_XGB$overall["Kappa"],3))) +
+  geom_text(aes(label = ifelse(Freq > 0, Freq, '-')), color = "gray50") +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 0)
+  )
+```
+
+```{r echo=FALSE}
+RF_plot <- ggplot(as.data.frame(loocv_cm_rf$table), 
+       aes(x=factor(Reference, levels = rev(levels(Reference))), y=Prediction, fill=Freq)) + 
+  scale_fill_viridis_c(option = "A", begin = 0.15, end = 1, direction = -1) +
+  scale_x_discrete(position = "top") + 
+  coord_equal() +
+  geom_tile(color = "gray80") +
+  labs(x = "Ground Truth", y = "Prediction",
+       caption = paste("Accuracy:",round(loocv_cm_rf$overall["Accuracy"],3),
+                        "Kappa:",round(loocv_cm_rf$overall["Kappa"],3))) +
+  geom_text(aes(label = ifelse(Freq > 0, Freq, '-')), color = "gray50") +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 0)
+  )
+```
+
+```{r echo=FALSE}
+KNN_plot <- ggplot(as.data.frame(loocv_cm_KNN$table), 
+       aes(x=factor(Reference, levels = rev(levels(Reference))), y=Prediction, fill=Freq)) + 
+  scale_fill_viridis_c(option = "A", begin = 0.15, end = 1, direction = -1) +
+  scale_x_discrete(position = "top") + 
+  coord_equal() +
+  geom_tile(color = "gray80") +
+  labs(x = "Ground Truth", y = "Prediction",
+       caption = paste("Accuracy:",round(loocv_cm_KNN$overall["Accuracy"],3),
+                        "Kappa:",round(loocv_cm_KNN$overall["Kappa"],3))) +
+  geom_text(aes(label = ifelse(Freq > 0, Freq, '-')), color = "gray50") +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 0)
+  )
+```
+
+```{r echo=FALSE}
+SVM_plot <- ggplot(as.data.frame(loocv_cm_SVM$table), 
+       aes(x=factor(Reference, levels = rev(levels(Reference))), y=Prediction, fill=Freq)) + 
+  scale_fill_viridis_c(option = "A", begin = 0.15, end = 1, direction = -1) +
+  scale_x_discrete(position = "top") + 
+  coord_equal() +
+  geom_tile(color = "gray80") +
+  labs(x = "Ground Truth", y = "Prediction",
+       caption = paste("Accuracy:",round(loocv_cm_SVM$overall["Accuracy"],3),
+                        "Kappa:",round(loocv_cm_SVM$overall["Kappa"],3))) +
+  geom_text(aes(label = ifelse(Freq > 0, Freq, '-')), color = "gray50") +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 0)
+  )
+```
+
+```{r fig.width = 10, fig.height=8}
+plot_grid(mah_plot, mah_plot_T2, XGB_plot, RF_plot, KNN_plot, SVM_plot,
+          labels = c("Mahalanobis", "Hotelling'sT2", 
+                     "XGB", "RF", "KNN", "SVM"), align = "h", nrow = 2)
+```
+
+
+## PCA Predictions
+
+```{r}
+# use group centroids centroid from train only data (or just remove "UNK"?). Nope, needs to be only train data b/c I can't just remove UNK and AECOM classes from ML models
+# predict on all data, extract the new data
+
+# or get all the PCA ordinations from the full dataset, then fit models on train part.
+# therefore pca features "consider" the location of the test data, but only use known
+## known groups for model class. Seems a little off, but need to see what step et al did.
+# I think step did the above (pg. 79, "complete data set"), as such I need to use PCA from 'joint_NAA_wide'
+
+## princomp (legacy method, but closer results to paper)
+## compute the joint data PCA for biplots of all points with test points (ggplot version)
+# joint_NAA_pca <- princomp(joint_NAA_wide[,-c(1:3)] )
+joint_NAA_pca <- prcomp(joint_NAA_wide[,-c(1:3)], retx = TRUE, center = TRUE, scale. = FALSE)
+
+
+```
+
+### Joint data Biplots and all that stuff
+PLOTS GO HERE
+
+```{r}
+joint_NAA_data_pca <- cbind(joint_NAA_wide[,1:3],as.data.frame(joint_NAA_pca$x[,1:5])) %>%
+  mutate(Quarry_Zone_Group = factor(Quarry_Zone_Group))
+```
+
+#### Mahalanobis
+
+```{r}
+# NAA_train_data_pca == centroids of train data
+# joint_NAA_data_pca == all data (need to remove UNK and AECOM groups)
+X <- joint_NAA_data_pca %>% 
+  dplyr::mutate(Quarry_Zone_Group = as.character(Quarry_Zone_Group)) %>% 
+  dplyr::filter(Quarry_Zone_Group %ni% c("UNK","AECOM")) %>% 
+  dplyr::select(-Sample, -Quarry_Zone) %>% 
+  split(.$Quarry_Zone_Group)
+Xn <- X %>% 
+  map_int(., nrow)
+X_bar <- X %>% 
+  map(., function(.x) colMeans(.x[,-1])) 
+
+# NAA_train_data_pca == I matrix of train data
+# joint_NAA_data_pca == all data
+# I <- joint_NAA_data_pca %>% 
+#   dplyr::mutate(Quarry_Zone_Group = as.character(Quarry_Zone_Group)) %>% 
+#   dplyr::filter(Quarry_Zone_Group %ni% c("UNK","AECOM")) %>% 
+#   dplyr::select(-Sample, -Quarry_Zone) %>% 
+#   split(.$Quarry_Zone_Group) %>% 
+#   map(., function(.x) cov(.x[,-1])) %>% 
+#   map(., function(.x) solve(.x, tol = 1.18394e-23)) ## had to make tol very small to solve
+
+# joint_NAA_data_pca == full joint dataset
+joint_y_train = joint_NAA_data_pca %>% 
+  dplyr::select(-Quarry_Zone, -Quarry_Zone_Group) %>% 
+  split(.$Sample) %>% 
+  map(., function(.x) as.matrix(.x[,-1]))
+
+## my original function that returned a Mahalanobis distance
+# joint_mah_distance <- map(joint_y_train, function(x) map2(X_bar, I, function(y,z) mah_func(x,y,z))) %>% 
+#   map(., bind_rows) %>% 
+#   bind_rows(., .id = "Sample") 
+
+## new function that returns a p-value of the Hotelling's T2 test on the Mahalnobis distance
+joint_mah_distance <- map(joint_y_train, function(.y) map(X, function(.X) mah_func_T2(.X[,-1],.y))) %>% 
+  map(., bind_rows) %>% 
+  bind_rows(., .id = "Sample") 
+
+joint_mah_distance_min <- joint_mah_distance %>% 
+  gather(Group_min, value, -Sample) %>% 
+  dplyr::group_by(Sample) %>% 
+  filter(value == max(value)) %>% 
+  dplyr::select(-value) %>%
+  left_join(joint_mah_distance, ., by = "Sample")
+
+joint_mah_AECOM_pred <- joint_mah_distance_min %>% 
+  filter(grepl("AEC", Sample))
+
+joint_mah_step_test_pred <- joint_mah_distance_min %>% 
+  filter(Sample %in% paste0("FBL0",72:80))
+```
+
+#### All ML Models
+```{r}
+# fit ml models on train data, predict on all data, extract AECOM and step-test data
+#! This differs from the above Mahalanobis test b/c I cannot train on unlabelled data as I do there
+
+# XGB
+join_XGB_pca <- fit(object = spec_XGB,
+          formula = NAA_form,
+          data = NAA_train_data_pca[,-c(1:2)])
+join_XGB_pred_pca <- predict(join_XGB_pca, new_data = joint_NAA_data_pca) %>% 
+  bind_cols(joint_NAA_data_pca,.)
+AECOM_XGB_pred_pca <- join_XGB_pred_pca %>% 
+  filter(grepl("AEC", Sample))
+step_XGB_pred_pca <- join_XGB_pred_pca %>% 
+  filter(Sample %in% paste0("FBL0",72:80))
+
+# RF
+join_RF_pca <- fit(object = spec_rf,
+          formula = NAA_form,
+          data = NAA_train_data_pca[,-c(1:2)])
+join_RF_pred_pca <- predict(join_RF_pca, new_data = joint_NAA_data_pca) %>% 
+  bind_cols(joint_NAA_data_pca,.)
+AECOM_RF_pred_pca <- join_RF_pred_pca %>% 
+  filter(grepl("AEC", Sample))
+step_RF_pred_pca <- join_RF_pred_pca %>% 
+  filter(Sample %in% paste0("FBL0",72:80))
+
+# KNN
+join_KNN_pca <- fit(object = spec_KNN,
+          formula = NAA_form,
+          data = NAA_train_data_pca[,-c(1:2)])
+join_KNN_pred_pca <- predict(join_KNN_pca, new_data = joint_NAA_data_pca) %>% 
+  bind_cols(joint_NAA_data_pca,.)
+AECOM_KNN_pred_pca <- join_KNN_pred_pca %>% 
+  filter(grepl("AEC", Sample))
+step_KNN_pred_pca <- join_KNN_pred_pca %>% 
+  filter(Sample %in% paste0("FBL0",72:80))
+
+# SVM
+join_SVM_pca <- fit(object = spec_SVM,
+          formula = NAA_form,
+          data = NAA_train_data_pca[,-c(1:2)])
+join_SVM_pred_pca <- predict(join_SVM_pca, new_data = joint_NAA_data_pca) %>% 
+  bind_cols(joint_NAA_data_pca,.)
+AECOM_SVM_pred_pca <- join_SVM_pred_pca %>% 
+  filter(grepl("AEC", Sample))
+step_SVM_pred_pca <- join_SVM_pred_pca %>% 
+  filter(Sample %in% paste0("FBL0",72:80))
+```
+
+### Steponaitis PCA Predictions
+```{r}
+# table of test sample group assignment
+Step_pred_Group_pca <- joint_mah_step_test_pred %>% 
+  dplyr::select(Sample, "Mahalanobis" = Group_min) %>% 
+  left_join(., dplyr::select(step_XGB_pred_pca, Sample, "XGB" = .pred_class), by="Sample") %>% 
+  left_join(., dplyr::select(step_RF_pred_pca, Sample, "RF" = .pred_class), by="Sample") %>% 
+  left_join(., dplyr::select(step_KNN_pred_pca, Sample, "KNN" = .pred_class), by="Sample") %>% 
+  left_join(., dplyr::select(step_SVM_pred_pca, Sample, "SVM" = .pred_class), by="Sample") %>% 
+  left_join(., data.frame(Sample = paste0("FBL",str_pad(72:80,3,"left",0)),
+                         Steponaitis = c("Uwharrie.1?","Chatham.1?,Person?",
+                                         "Uwharrie.1","Chatham.1?,Person?",
+                                         "Uwharrie.1","Uwharrie.1","Uwharrie.1?",
+                                         "Uwharrie.1?","Uwharrie.1?"))) # from table 7.4
+
+kable(Step_pred_Group_pca)
+```
+
+
+### AECOM PCA Predictions
+```{r}
+# table of test sample group assignment
+AECOM_pred_Group_pca <- joint_mah_AECOM_pred %>% 
+  dplyr::select(Sample, "Mahalanobis" = Group_min) %>% 
+  left_join(., dplyr::select(AECOM_XGB_pred_pca, Sample, "XGB" = .pred_class), by="Sample") %>% 
+  left_join(., dplyr::select(AECOM_RF_pred_pca, Sample, "RF" = .pred_class), by="Sample") %>% 
+  left_join(., dplyr::select(AECOM_KNN_pred_pca, Sample, "KNN" = .pred_class), by="Sample") %>% 
+  left_join(., dplyr::select(AECOM_SVM_pred_pca, Sample, "SVM" = .pred_class), by="Sample") %>% 
+  left_join(., data.frame(Sample = paste0("AEC",str_pad(1:12,3,"left",0)), 
+                         Seramur = c("Chatham.1","Chatham.1","Chatham.1","Person",
+                                     "Chatham.1","Chatham.1","Chatham.1","Uwharrie.2",
+                                     "Chatham.1","Chatham.1","Chatham.1","Uwharrie.2")))
+
+kable(AECOM_pred_Group_pca)
+```
+
+
+## Non-PCA Validation
+
+### LOOCV
+
+```{r}
+NAA_train_data <- NAA_train_data %>% 
+  data.frame() %>% 
+  mutate(Quarry_Zone_Group = factor(Quarry_Zone_Group))
+  
+head(NAA_train_data) %>% dplyr::select(1:10) %>% kable()
+
+```
+
+#### XGB
+```{r echo=FALSE}
+loocv_splits_XGB_nonpca <- loo_cv(data = as.data.frame(NAA_train_data)) %>%
+  mutate(
+    id         = map_chr(splits, get_id_left_out, "Sample"),
+    Quarry     = map_chr(splits, get_id_left_out, "Quarry_Zone_Group"),
+    models_XGB = map(splits, fit_model, spec_XGB, form=NAA_form, remove_cols=c("Sample","Quarry_Zone")),
+    pred_XGB   = map2(splits, models_XGB, compute_pred),
+    perf_XGB   = map(pred_XGB, compute_perf),
+    accuracy   = map_dbl(perf_XGB, ~ as.numeric(.x[1,3])),
+    pred_class = map_chr(pred_XGB, ~ as.character(.x[1,".pred_class"]))
+  )
+
+loocv_results_XGB_nonpca <- loocv_splits_XGB_nonpca %>% 
+  dplyr::select("Sample" = id, "Quarry_Zone_Group" = Quarry, pred_class) %>% 
+  mutate(correct = as.numeric(Quarry_Zone_Group == pred_class),
+         Quarry_Zone_Group = as.factor(Quarry_Zone_Group),
+         pred_class = as.factor(pred_class))
+loocv_cm_XGB_nonpca <- confusionMatrix(data = loocv_results_XGB_nonpca$pred_class, 
+                                reference = loocv_results_XGB_nonpca$Quarry_Zone_Group)
+```
+
+
+#### RF
+```{r echo=FALSE}
+loocv_splits_rf_nonpca <- loo_cv(data = NAA_train_data) %>%
+  mutate(
+    id         = map_chr(splits, get_id_left_out, "Sample"),
+    Quarry     = map_chr(splits, get_id_left_out, "Quarry_Zone_Group"),
+    models_rf  = map(splits, fit_model, spec_rf, form=NAA_form, remove_cols=c("Sample","Quarry_Zone")),
+    pred_rf    = map2(splits, models_rf, compute_pred),
+    perf_rf    = map(pred_rf, compute_perf),
+    accuracy   = map_dbl(perf_rf, ~ as.numeric(.x[1,3])),
+    pred_class = map_chr(pred_rf, ~ as.character(.x[1,".pred_class"]))
+  )
+
+loocv_results_rf_nonpca <- loocv_splits_rf_nonpca %>% 
+  dplyr::select("Sample" = id, "Quarry_Zone_Group" = Quarry, pred_class) %>% 
+  mutate(correct = as.numeric(Quarry_Zone_Group == pred_class),
+         Quarry_Zone_Group = as.factor(Quarry_Zone_Group),
+         pred_class = as.factor(pred_class))
+loocv_cm_rf_nonpca <- confusionMatrix(data = loocv_results_rf_nonpca$pred_class, 
+                                reference = loocv_results_rf_nonpca$Quarry_Zone_Group)
+```
+
+#### KNN
+```{r echo=FALSE, cache=TRUE}
+loocv_splits_KNN_nonpca <- loo_cv(data = NAA_train_data) %>%
+  mutate(
+    id         = map_chr(splits, get_id_left_out, "Sample"),
+    Quarry     = map_chr(splits, get_id_left_out, "Quarry_Zone_Group"),
+    models_KNN = map(splits, fit_model, spec_KNN, form=NAA_form, remove_cols=c("Sample","Quarry_Zone")),
+    pred_KNN   = map2(splits, models_KNN, compute_pred),
+    perf_KNN   = map(pred_KNN, compute_perf),
+    accuracy   = map_dbl(perf_KNN, ~ as.numeric(.x[1,3])),
+    pred_class = map_chr(pred_KNN, ~ as.character(.x[1,".pred_class"]))
+  )
+
+loocv_results_KNN_nonpca <- loocv_splits_KNN_nonpca %>% 
+  dplyr::select("Sample" = id, "Quarry_Zone_Group" = Quarry, pred_class) %>% 
+  mutate(correct = as.numeric(Quarry_Zone_Group == pred_class),
+         Quarry_Zone_Group = as.factor(Quarry_Zone_Group),
+         pred_class = as.factor(pred_class))
+loocv_cm_KNN_nonpca <- confusionMatrix(data = loocv_results_KNN_nonpca$pred_class, 
+                                reference = loocv_results_KNN_nonpca$Quarry_Zone_Group)
+```
+
+#### SVM
+```{r echo=FALSE}
+loocv_splits_SVM_nonpca <- loo_cv(data = NAA_train_data) %>%
+  mutate(
+    id         = map_chr(splits, get_id_left_out, "Sample"),
+    Quarry     = map_chr(splits, get_id_left_out, "Quarry_Zone_Group"),
+    models_SVM = map(splits, fit_model, spec_SVM, form=NAA_form, remove_cols=c("Sample","Quarry_Zone")),
+    pred_SVM   = map2(splits, models_SVM, compute_pred),
+    perf_SVM   = map(pred_SVM, compute_perf),
+    accuracy   = map_dbl(perf_SVM, ~ as.numeric(.x[1,3])),
+    pred_class = map_chr(pred_SVM, ~ as.character(.x[1,".pred_class"]))
+  )
+
+loocv_results_SVM_nonpca <- loocv_splits_SVM_nonpca %>% 
+  dplyr::select("Sample" = id, "Quarry_Zone_Group" = Quarry, pred_class) %>% 
+  mutate(correct = as.numeric(Quarry_Zone_Group == pred_class),
+         Quarry_Zone_Group = as.factor(Quarry_Zone_Group),
+         pred_class = as.factor(pred_class))
+loocv_cm_SVM_nonpca <- confusionMatrix(data = loocv_results_SVM_nonpca$pred_class, 
+                                reference = loocv_results_SVM_nonpca$Quarry_Zone_Group)
+```
+
+### Confusion Matrix Plots
+```{r echo=FALSE}
+XGB_plot_nonpca <- ggplot(as.data.frame(loocv_cm_XGB_nonpca$table), 
+       aes(x=factor(Reference, levels = rev(levels(Reference))), y=Prediction, fill=Freq)) + 
+  scale_fill_viridis_c(option = "D", begin = 0.15, end = 1, direction = -1) +
+  scale_x_discrete(position = "top") + 
+  coord_equal() +
+  geom_tile(color = "gray80") +
+  labs(x = "Ground Truth", y = "Prediction",
+       caption = paste("Accuracy:",round(loocv_cm_XGB_nonpca$overall["Accuracy"],3),
+                        "Kappa:",round(loocv_cm_XGB_nonpca$overall["Kappa"],3))) +
+  geom_text(aes(label = ifelse(Freq > 0, Freq, '-')), color = "gray50") +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 0)
+  )
+```
+
+```{r echo=FALSE}
+RF_plot_nonpca <- ggplot(as.data.frame(loocv_cm_rf_nonpca$table), 
+       aes(x=factor(Reference, levels = rev(levels(Reference))), y=Prediction, fill=Freq)) + 
+  scale_fill_viridis_c(option = "D", begin = 0.15, end = 1, direction = -1) +
+  scale_x_discrete(position = "top") + 
+  coord_equal() +
+  geom_tile(color = "gray80") +
+  labs(x = "Ground Truth", y = "Prediction",
+       caption = paste("Accuracy:",round(loocv_cm_rf_nonpca$overall["Accuracy"],3),
+                        "Kappa:",round(loocv_cm_rf_nonpca$overall["Kappa"],3))) +
+  geom_text(aes(label = ifelse(Freq > 0, Freq, '-')), color = "gray50") +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 0)
+  )
+```
+
+```{r echo=FALSE}
+KNN_plot_nonpca <- ggplot(as.data.frame(loocv_cm_KNN_nonpca$table), 
+       aes(x=factor(Reference, levels = rev(levels(Reference))), y=Prediction, fill=Freq)) + 
+  scale_fill_viridis_c(option = "D", begin = 0.15, end = 1, direction = -1) +
+  scale_x_discrete(position = "top") + 
+  coord_equal() +
+  geom_tile(color = "gray80") +
+  labs(x = "Ground Truth", y = "Prediction",
+       caption = paste("Accuracy:",round(loocv_cm_KNN_nonpca$overall["Accuracy"],3),
+                        "Kappa:",round(loocv_cm_KNN_nonpca$overall["Kappa"],3))) +
+  geom_text(aes(label = ifelse(Freq > 0, Freq, '-')), color = "gray50") +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 0)
+  )
+```
+
+```{r echo=FALSE}
+SVM_plot_nonpca <- ggplot(as.data.frame(loocv_cm_SVM_nonpca$table), 
+       aes(x=factor(Reference, levels = rev(levels(Reference))), y=Prediction, fill=Freq)) + 
+  scale_fill_viridis_c(option = "D", begin = 0.15, end = 1, direction = -1) +
+  scale_x_discrete(position = "top") + 
+  coord_equal() +
+  geom_tile(color = "gray80") +
+  labs(x = "Ground Truth", y = "Prediction",
+       caption = paste("Accuracy:",round(loocv_cm_SVM_nonpca$overall["Accuracy"],3),
+                        "Kappa:",round(loocv_cm_SVM_nonpca$overall["Kappa"],3))) +
+  geom_text(aes(label = ifelse(Freq > 0, Freq, '-')), color = "gray50") +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 0)
+  )
+```
+
+```{r fig.width = 10, fig.height=8}
+plot_grid(XGB_plot_nonpca, RF_plot_nonpca, KNN_plot_nonpca, SVM_plot_nonpca,
+          labels = c("XGB", "RF", "KNN", "SVM"), align = "h", nrow = 2)
+```
+
+
+## Non-PCA Predictions
+```{r}
+# fit ml models on train data, predict on all data, extract AECOM and step-test data
+# XGB
+join_XGB_nonpca <- fit(object = spec_XGB,
+          formula = NAA_form,
+          data = NAA_train_data[,-c(1:2)] %>% 
+            mutate(Quarry_Zone_Group = factor(Quarry_Zone_Group)))
+join_XGB_pred_nonpca <- predict(join_XGB_nonpca, new_data = joint_NAA_wide) %>% 
+  bind_cols(joint_NAA_wide,.)
+AECOM_XGB_pred_nonpca <- join_XGB_pred_nonpca %>% 
+  filter(grepl("AEC", Sample))
+step_XGB_pred_nonpca <- join_XGB_pred_nonpca %>% 
+  filter(Sample %in% paste0("FBL0",72:80))
+
+# RF
+join_RF_nonpca <- fit(object = spec_rf,
+          formula = NAA_form,
+          data = NAA_train_data[,-c(1:2)] %>% 
+            mutate(Quarry_Zone_Group = factor(Quarry_Zone_Group)))
+join_RF_pred_nonpca <- predict(join_RF_nonpca, new_data = joint_NAA_wide) %>% 
+  bind_cols(joint_NAA_wide,.)
+AECOM_RF_pred_nonpca <- join_RF_pred_nonpca %>% 
+  filter(grepl("AEC", Sample))
+step_RF_pred_nonpca <- join_RF_pred_nonpca %>% 
+  filter(Sample %in% paste0("FBL0",72:80))
+
+# KNN
+join_KNN_nonpca <- fit(object = spec_KNN,
+          formula = NAA_form,
+          data = NAA_train_data[,-c(1:2)] %>% 
+            mutate(Quarry_Zone_Group = factor(Quarry_Zone_Group)))
+join_KNN_pred_nonpca <- predict(join_KNN_nonpca, new_data = joint_NAA_wide) %>% 
+  bind_cols(joint_NAA_wide,.)
+AECOM_KNN_pred_nonpca <- join_KNN_pred_nonpca %>% 
+  filter(grepl("AEC", Sample))
+step_KNN_pred_nonpca <- join_KNN_pred_nonpca %>% 
+  filter(Sample %in% paste0("FBL0",72:80))
+
+# SVM
+join_SVM_nonpca <- fit(object = spec_SVM,
+          formula = NAA_form,
+          data = NAA_train_data[,-c(1:2)] %>% 
+            mutate(Quarry_Zone_Group = factor(Quarry_Zone_Group)))
+join_SVM_pred_nonpca <- predict(join_SVM_nonpca, new_data = joint_NAA_wide) %>% 
+  bind_cols(joint_NAA_wide,.)
+AECOM_SVM_pred_nonpca <- join_SVM_pred_nonpca %>% 
+  filter(grepl("AEC", Sample))
+step_SVM_pred_nonpca <- join_SVM_pred_nonpca %>% 
+  filter(Sample %in% paste0("FBL0",72:80))
+```
+
+### Steponaitis Non-PCA Predictions
+```{r}
+# table of test sample group assignment
+Step_pred_Group_nonpca <- step_XGB_pred_nonpca %>% 
+  dplyr::select(Sample, "XGB" = .pred_class) %>% 
+  left_join(., dplyr::select(step_RF_pred_nonpca, Sample, "RF" = .pred_class), by="Sample") %>% 
+  left_join(., dplyr::select(step_KNN_pred_nonpca, Sample, "KNN" = .pred_class), by="Sample") %>% 
+  left_join(., dplyr::select(step_SVM_pred_nonpca, Sample, "SVM" = .pred_class), by="Sample")
+
+kable(Step_pred_Group_nonpca)
+```
+
+### AECOM Non-PCA Predictions
+```{r}
+# table of test sample group assignment
+AECOM_pred_Group_nonpca <- AECOM_XGB_pred_nonpca %>% 
+  dplyr::select(Sample, "XGB" = .pred_class) %>% 
+  left_join(., dplyr::select(AECOM_RF_pred_nonpca, Sample, "RF" = .pred_class), by="Sample") %>% 
+  left_join(., dplyr::select(AECOM_KNN_pred_nonpca, Sample, "KNN" = .pred_class), by="Sample") %>% 
+  left_join(., dplyr::select(AECOM_SVM_pred_nonpca, Sample, "SVM" = .pred_class), by="Sample")
+
+kable(AECOM_pred_Group_nonpca)
+```
+
+
