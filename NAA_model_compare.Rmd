@@ -384,22 +384,33 @@ y_train = NAA_train_data_pca %>%
   split(.$Sample) %>% 
   map(., function(.x) as.matrix(.x[,-1]))
 
+##################################!!!!!!!!!!!!!!!!!!!#####################
+## 2021/07/14 HBD! - think I solved this. We needed a wide form.
+## That needed an extra as.data.frame to take a named vector into df
+## Not sure what in `map2()` changed, but troublesome error to fix
+
 ## original method. behavior of dplyr::bind_rows may have changed
 ## returns data in wide format due to differing column names
-loo_mah_distance <- map2(y_train, names(y_train),
-                     function(.y,.name) loo_mah_func(.y, .name, NAA_train_data_pca)) %>%
-  map(., bind_rows)  %>%
-  bind_rows(., .id = "Sample")
+# loo_mah_distance <- map2(y_train, names(y_train),
+#                      function(.y,.name) loo_mah_func(.y, .name, NAA_train_data_pca)) %>%
+#   map(., bind_rows)  %>%
+#   bind_rows(., .id = "Sample")
 
 ## V2 update: do I want this as a wide or long dataset? not sure yet.
 ## here is long form
-loo_mah_distance <- map2(y_train, names(y_train), 
-                     function(.y,.name) loo_mah_func(.y, .name, NAA_train_data_pca)) %>% 
-  map(., bind_rows, .id = "Quarry_Zone")  %>%
-  map(., function(.x) dplyr::rename(.x, "dist" = 2)) %>% 
+# loo_mah_distance <- map2(y_train, names(y_train), 
+#                      function(.y,.name) loo_mah_func(.y, .name, NAA_train_data_pca)) %>% 
+#   map(., bind_rows, .id = "Quarry_Zone")  %>%
+#   map(., function(.x) dplyr::rename(.x, "dist" = 2)) %>% 
+#   bind_rows(., .id = "Sample")
+
+## here is wide form (USE THIS! was able to replicate original results)
+loo_mah_distance <- map2(y_train, names(y_train),
+                     function(.y,.name) loo_mah_func(.y, .name, NAA_train_data_pca)) %>%
+  map(., function(.x) as.data.frame(.x)) %>% 
   bind_rows(., .id = "Sample")
 
-
+##################################!!!!!!!!!!!!!!!!!!!#####################
 
 loo_mah_T2 <- map2(y_train, names(y_train), 
                      function(.y,.name) loo_mah_func_T2(.y, .name, NAA_train_data_pca,
